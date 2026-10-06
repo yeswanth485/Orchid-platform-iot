@@ -1520,3 +1520,290 @@ def energy_summary(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to calculate energy summary: {exc}")
+
+
+# ============================================================
+# MULTI-AC BRANCH OVERVIEW
+# ============================================================
+
+@app.get('/api/v1/branches/{branch_code}/overview')
+def branch_overview(
+    branch_code: str,
+    stale_after_seconds: int = Query(default=60, ge=10, le=3600),
+    tariff_per_kwh: float = Query(default=8.00, gt=0),
+):
+    """Return the latest state of every registered AC/device in a branch.
+
+    This endpoint is designed for a branch dashboard. It does not require
+    every AC to be sending at the exact same moment.
+    """
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        a.id AS asset_id,
+                        a.asset_code,
+                        a.name AS asset_name,
+                        a.quantity,
+                        a.tonnage_tr,
+                        a.phase_count,
+                        a.voltage_basis,
+                        a.inverter,
+                        a.rated_power_kw,
+                        a.eer,
+                        a.measurement_mode,
+                        d.device_id,
+                        d.active AS device_active,
+                        d.last_seen_at,
+                        t.voltage,
+                        t.current,
+                        t.power,
+                        t.energy_kwh,
+                        t.frequency,
+                        t.power_factor,
+                        t.recorded_at,
+                        t.interval_energy_kwh,
+                        t.energy_reset
+                    FROM branches b
+                    JOIN assets a
+                      ON a.branch_id = b.id
+                    LEFT JOIN devices d
+                      ON d.asset_id = a.id
+                    LEFT JOIN LATERAL (
+                        SELECT
+                            voltage,
+                            current,
+                            power,
+                            energy_kwh,
+                            frequency,
+                            power_factor,
+                            recorded_at,
+                            interval_energy_kwh,
+                            energy_reset
+                        FROM telemetry
+                        WHERE device_id = d.device_id
+                        ORDER BY recorded_at DESC, id DESC
+                        LIMIT 1
+                    ) t ON TRUE
+                    WHERE b.branch_code = %s
+                    ORDER BY a.id;
+                    """,
+                    (branch_code,),
+                )
+                rows = cursor.fetchall()
+
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS telemetry_rows,
+                        COUNT(DISTINCT device_id) AS devices_with_data,
+                        COALESCE(SUM(interval_energy_kwh), 0) AS today_energy_kwh
+                    FROM telemetry
+                    WHERE branch_id = %s
+                      AND recorded_at >= date_trunc(
+                          'day',
+                          NOW() AT TIME ZONE 'Asia/Kolkata'
+                      ) AT TIME ZONE 'Asia/Kolkata'
+                      AND recorded_at < (
+                          date_trunc(
+                              'day',
+                              NOW() AT TIME ZONE 'Asia/Kolkata'
+                          ) + INTERVAL '1 day'
+                      ) AT TIME ZONE 'Asia/Kolkata';
+                    """,
+                    (branch_code,),
+                )
+                aggregate = cursor.fetchone()
+
+        now_utc = datetime.now(timezone.utc)
+        assets = []
+        online_devices = 0
+        devices_with_data = 0
+        total_current_a = 0.0
+        total_power_kw = 0.0
+
+        for row in rows:
+            (
+                asset_id,
+                asset_code,
+                asset_name,
+                quantity,
+                tonnage_tr,
+                phase_count,
+                voltage_basis,
+                inverter,
+                rated_power_kw,
+                eer,
+                measurement_mode,
+                device_id,
+                device_active,
+                last_seen_at,
+                voltage,
+                current,
+                power,
+                energy_kwh,
+                frequency,
+                pf,
+                recorded_at,
+                interval_energy_kwh,
+                energy_reset,
+            ) = row
+
+            online = False
+            if last_seen_at is not None:
+                online = (now_utc - last_seen_at).total_seconds() <= stale_after_seconds
+
+            if online:
+                online_devices += 1
+
+            if device_id is not None and recorded_at is not None:
+                devices_with_data += 1
+
+            if power is not None and online:
+                total_power_kw += float(power) / 1000.0
+
+            if current is not None and online:
+                total_current_a += float(current)
+
+            assets.append(
+                {
+                    'asset_id': asset_id,
+                    'asset_code': asset_code,
+                    'asset_name': asset_name,
+                    'quantity': quantity,
+                    'tonnage_tr': tonnage_tr,
+                    'phase_count': phase_count,
+                    'voltage_basis': voltage_basis,
+                    'inverter': inverter,
+                    'rated_power_kw': rated_power_kw,
+                    'eer': eer,
+                    'measurement_mode': measurement_mode,
+                    'device_id': device_id,
+                    'device_active': device_active,
+                    'online': online,
+                    'last_seen_at': last_seen_at,
+                    'latest': (
+                        {
+                            'voltage_v': voltage,
+                            'current_a': current,
+                            'power_w': power,
+                            'power_kw': round(float(power) / 1000.0, 6) if power is not None else None,
+                            'cumulative_energy_kwh': energy_kwh,
+                            'frequency_hz': frequency,
+                            'power_factor': pf,
+                            'recorded_at': recorded_at,
+                            'interval_energy_kwh': interval_energy_kwh,
+                            'energy_reset': energy_reset,
+                        }
+                        if recorded_at is not None
+                        else None
+                    ),
+                }
+            )
+
+        registered_assets = len(assets)
+        connected_assets = sum(1 for a in assets if a['device_id'] is not None)
+        offline_devices = max(connected_assets - online_devices, 0)
+        today_energy_kwh = float(aggregate[2] or 0.0)
+
+        return {
+            'status': 'success',
+            'branch_code': branch_code,
+            'summary': {
+                'registered_assets': registered_assets,
+                'registered_devices': connected_assets,
+                'devices_with_data': devices_with_data,
+                'online_devices': online_devices,
+                'offline_devices': offline_devices,
+                'current_total_power_kw': round(total_power_kw, 6),
+                'current_total_current_a': round(total_current_a, 3),
+                'today_energy_kwh': round(today_energy_kwh, 6),
+                'today_estimated_cost': round(today_energy_kwh * tariff_per_kwh, 2),
+                'tariff_per_kwh': tariff_per_kwh,
+                'stale_after_seconds': stale_after_seconds,
+                'telemetry_rows_today': int(aggregate[0] or 0),
+            },
+            'assets': assets,
+            'calculation_note': (
+                'Branch energy is the sum of stored per-device interval energy deltas. '
+                'Current total power is the sum of the latest online meter-reported power values.'
+            ),
+        }
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Failed to load branch overview: {exc}')
+
+
+# ============================================================
+# MULTI-AC BRANCH DAILY ENERGY
+# ============================================================
+
+@app.get('/api/v1/branches/{branch_code}/energy/daily')
+def branch_daily_energy(
+    branch_code: str,
+    days: int = Query(default=7, ge=1, le=90),
+    tariff_per_kwh: float = Query(default=8.00, gt=0),
+):
+    """Return branch-wide daily energy totals across all devices."""
+    try:
+        today_local = datetime.now(INDIA_TZ).date()
+        start_date = today_local - timedelta(days=days - 1)
+        start_local = datetime.combine(start_date, time.min, tzinfo=INDIA_TZ)
+        end_local = datetime.combine(today_local, time.min, tzinfo=INDIA_TZ) + timedelta(days=1)
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = end_local.astimezone(timezone.utc)
+
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        (recorded_at AT TIME ZONE 'Asia/Kolkata')::date AS local_date,
+                        COALESCE(SUM(interval_energy_kwh), 0) AS energy_kwh,
+                        COUNT(*) AS readings,
+                        COUNT(DISTINCT device_id) AS devices_reporting,
+                        BOOL_OR(energy_reset) AS had_reset
+                    FROM telemetry
+                    WHERE branch_id = %s
+                      AND recorded_at >= %s
+                      AND recorded_at < %s
+                    GROUP BY local_date
+                    ORDER BY local_date;
+                    """,
+                    (branch_code, start_utc, end_utc),
+                )
+                rows = cursor.fetchall()
+
+        total_energy = 0.0
+        data = []
+        for row in rows:
+            local_date, energy_kwh, readings, devices_reporting, had_reset = row
+            energy_kwh = float(energy_kwh or 0.0)
+            total_energy += energy_kwh
+            data.append(
+                {
+                    'date': local_date.isoformat(),
+                    'energy_consumed_kwh': round(energy_kwh, 6),
+                    'estimated_cost': round(energy_kwh * tariff_per_kwh, 2),
+                    'readings': int(readings),
+                    'devices_reporting': int(devices_reporting),
+                    'meter_reset_detected': bool(had_reset),
+                }
+            )
+
+        return {
+            'status': 'success',
+            'branch_code': branch_code,
+            'start_date': start_date.isoformat(),
+            'end_date': today_local.isoformat(),
+            'days_requested': days,
+            'tariff_per_kwh': tariff_per_kwh,
+            'total_energy_kwh': round(total_energy, 6),
+            'total_estimated_cost': round(total_energy * tariff_per_kwh, 2),
+            'calculation': 'Sum of per-device interval energy deltas across the branch.',
+            'data': data,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Failed to calculate branch daily energy: {exc}')
