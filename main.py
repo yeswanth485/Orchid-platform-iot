@@ -248,6 +248,27 @@ def initialize_database():
                 cursor.execute(statement)
 
             # ------------------------
+            # Gateway channel mapping
+            # ------------------------
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gateway_channels (
+                    id BIGSERIAL PRIMARY KEY,
+                    gateway_id VARCHAR(100) NOT NULL,
+                    branch_id BIGINT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+                    channel_id INTEGER NOT NULL,
+                    asset_id BIGINT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+                    device_id VARCHAR(100) NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    last_seen_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(gateway_id, channel_id),
+                    UNIQUE(device_id)
+                );
+                """
+            )
+
+            # ------------------------
             # Indexes
             # ------------------------
             cursor.execute(
@@ -348,6 +369,46 @@ class MainMeterAllocationRequest(BaseModel):
     non_ac_power_kw: float = Field(default=0.0, ge=0)
     interval_hours: float = Field(default=1.0, gt=0)
     assets: List[AllocationItem] = Field(..., min_length=1)
+
+
+class GatewayChannelSetup(BaseModel):
+    channel_id: int = Field(..., ge=1, le=1000)
+    asset_code: str = Field(..., min_length=1, max_length=100)
+    name: str = Field(..., min_length=1, max_length=150)
+    asset_type: str = Field(default="HVAC", max_length=50)
+    quantity: int = Field(default=1, ge=1)
+    tonnage_tr: Optional[float] = Field(default=None, gt=0)
+    phase_count: int = Field(default=1, ge=1, le=3)
+    voltage_basis: VoltageBasis = "line_to_neutral"
+    inverter: bool = False
+    rated_power_kw: Optional[float] = Field(default=None, gt=0)
+    eer: Optional[float] = Field(default=None, gt=0)
+    power_at_50_kw: Optional[float] = Field(default=None, gt=0)
+    power_at_100_kw: Optional[float] = Field(default=None, gt=0)
+    measurement_mode: MeasurementMode = "measured_submeter"
+    device_id: Optional[str] = Field(default=None, max_length=100)
+
+
+class GatewaySetupRequest(BaseModel):
+    gateway_id: str = Field(..., min_length=1, max_length=100)
+    branch_id: int
+    channels: List[GatewayChannelSetup] = Field(..., min_length=1, max_length=100)
+
+
+class BatchReading(BaseModel):
+    channel_id: int = Field(..., ge=1, le=1000)
+    voltage: float = Field(..., gt=0)
+    current: float = Field(..., ge=0)
+    power: float = Field(..., ge=0)
+    energy_kwh: float = Field(..., ge=0)
+    frequency: float = Field(..., gt=0)
+    power_factor: float = Field(..., ge=0, le=1.05)
+
+
+class BatchTelemetryRequest(BaseModel):
+    gateway_id: str = Field(..., min_length=1, max_length=100)
+    branch_id: str = Field(..., min_length=1, max_length=100)
+    readings: List[BatchReading] = Field(..., min_length=1, max_length=100)
 
 
 # ============================================================
@@ -1807,3 +1868,462 @@ def branch_daily_energy(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Failed to calculate branch daily energy: {exc}')
+
+
+# ============================================================
+# MULTI-CHANNEL GATEWAY SETUP
+# ============================================================
+
+@app.post("/api/v1/gateways/setup")
+def setup_gateway(data: GatewaySetupRequest):
+    """Create/update all AC assets, devices, and channel mappings for one gateway.
+
+    This is a one-time setup call. After this, the ESP32 gateway can send
+    all channel readings in one batch without registering each AC again.
+    """
+    channel_ids = [item.channel_id for item in data.channels]
+    if len(channel_ids) != len(set(channel_ids)):
+        raise HTTPException(
+            status_code=400,
+            detail="Duplicate channel_id values are not allowed in one gateway setup.",
+        )
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id FROM branches WHERE id = %s",
+                    (data.branch_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Branch not found")
+
+                configured = []
+
+                for item in data.channels:
+                    # Upsert asset.
+                    cursor.execute(
+                        """
+                        INSERT INTO assets(
+                            branch_id,
+                            asset_code,
+                            name,
+                            asset_type,
+                            quantity,
+                            tonnage_tr,
+                            phase_count,
+                            voltage_basis,
+                            inverter,
+                            rated_power_kw,
+                            eer,
+                            power_at_50_kw,
+                            power_at_100_kw,
+                            measurement_mode
+                        )
+                        VALUES(
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT(branch_id, asset_code) DO UPDATE SET
+                            name = EXCLUDED.name,
+                            asset_type = EXCLUDED.asset_type,
+                            quantity = EXCLUDED.quantity,
+                            tonnage_tr = EXCLUDED.tonnage_tr,
+                            phase_count = EXCLUDED.phase_count,
+                            voltage_basis = EXCLUDED.voltage_basis,
+                            inverter = EXCLUDED.inverter,
+                            rated_power_kw = EXCLUDED.rated_power_kw,
+                            eer = EXCLUDED.eer,
+                            power_at_50_kw = EXCLUDED.power_at_50_kw,
+                            power_at_100_kw = EXCLUDED.power_at_100_kw,
+                            measurement_mode = EXCLUDED.measurement_mode
+                        RETURNING id;
+                        """,
+                        (
+                            data.branch_id,
+                            item.asset_code,
+                            item.name,
+                            item.asset_type,
+                            item.quantity,
+                            item.tonnage_tr,
+                            item.phase_count,
+                            item.voltage_basis,
+                            item.inverter,
+                            item.rated_power_kw,
+                            item.eer,
+                            item.power_at_50_kw,
+                            item.power_at_100_kw,
+                            item.measurement_mode,
+                        ),
+                    )
+                    asset_id = cursor.fetchone()[0]
+
+                    device_id = item.device_id or f"{data.gateway_id}_CH_{item.channel_id:02d}"
+
+                    # Upsert device.
+                    cursor.execute(
+                        """
+                        INSERT INTO devices(device_id, asset_id, device_type)
+                        VALUES(%s, %s, 'gateway_channel')
+                        ON CONFLICT(device_id) DO UPDATE SET
+                            asset_id = EXCLUDED.asset_id,
+                            device_type = EXCLUDED.device_type
+                        RETURNING device_id;
+                        """,
+                        (device_id, asset_id),
+                    )
+                    registered_device_id = cursor.fetchone()[0]
+
+                    # Upsert gateway/channel mapping.
+                    cursor.execute(
+                        """
+                        INSERT INTO gateway_channels(
+                            gateway_id,
+                            branch_id,
+                            channel_id,
+                            asset_id,
+                            device_id,
+                            active
+                        )
+                        VALUES(%s, %s, %s, %s, %s, TRUE)
+                        ON CONFLICT(gateway_id, channel_id) DO UPDATE SET
+                            branch_id = EXCLUDED.branch_id,
+                            asset_id = EXCLUDED.asset_id,
+                            device_id = EXCLUDED.device_id,
+                            active = TRUE
+                        RETURNING channel_id, asset_id, device_id;
+                        """,
+                        (
+                            data.gateway_id,
+                            data.branch_id,
+                            item.channel_id,
+                            asset_id,
+                            registered_device_id,
+                        ),
+                    )
+                    mapping = cursor.fetchone()
+
+                    configured.append(
+                        {
+                            "channel_id": mapping[0],
+                            "asset_id": mapping[1],
+                            "device_id": mapping[2],
+                            "asset_code": item.asset_code,
+                        }
+                    )
+
+            conn.commit()
+
+        return {
+            "status": "success",
+            "gateway_id": data.gateway_id,
+            "branch_id": data.branch_id,
+            "channels_configured": len(configured),
+            "channels": configured,
+            "next_step": "Send all configured channels to POST /api/v1/telemetry/batch",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Gateway setup failed: {exc}")
+
+
+# ============================================================
+# MULTI-CHANNEL BATCH TELEMETRY
+# ============================================================
+
+@app.post("/api/v1/telemetry/batch")
+def receive_batch_telemetry(data: BatchTelemetryRequest):
+    """Receive all gateway channels in one HTTP request.
+
+    The server resolves each channel to its asset/device and stores each
+    channel as an independent telemetry record in one database transaction.
+    """
+    channel_ids = [item.channel_id for item in data.readings]
+    if len(channel_ids) != len(set(channel_ids)):
+        raise HTTPException(
+            status_code=400,
+            detail="Duplicate channel_id values are not allowed in one batch.",
+        )
+
+    recorded_at = datetime.now(timezone.utc)
+    stored = []
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                # Validate the gateway/branch relationship before inserting anything.
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM gateway_channels
+                    WHERE gateway_id = %s
+                      AND branch_id = (
+                          SELECT id FROM branches WHERE branch_code = %s LIMIT 1
+                      )
+                      AND active = TRUE;
+                    """,
+                    (data.gateway_id, data.branch_id),
+                )
+                mapping_count = cursor.fetchone()[0]
+                if mapping_count == 0:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Gateway is not configured for this branch. Run POST /api/v1/gateways/setup first.",
+                    )
+
+                for reading in data.readings:
+                    cursor.execute(
+                        """
+                        SELECT
+                            gc.asset_id,
+                            gc.device_id,
+                            a.phase_count,
+                            a.voltage_basis,
+                            a.measurement_mode
+                        FROM gateway_channels gc
+                        JOIN assets a ON a.id = gc.asset_id
+                        WHERE gc.gateway_id = %s
+                          AND gc.branch_id = (
+                              SELECT id FROM branches WHERE branch_code = %s LIMIT 1
+                          )
+                          AND gc.channel_id = %s
+                          AND gc.active = TRUE
+                        LIMIT 1;
+                        """,
+                        (data.gateway_id, data.branch_id, reading.channel_id),
+                    )
+                    mapping = cursor.fetchone()
+
+                    if mapping is None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Channel {reading.channel_id} is not configured for "
+                                f"gateway {data.gateway_id}. Run gateway setup first."
+                            ),
+                        )
+
+                    asset_id, device_id, phase_count, voltage_basis, measurement_mode = mapping
+                    cursor.execute(
+                        "SELECT asset_code FROM assets WHERE id = %s",
+                        (asset_id,),
+                    )
+                    asset_code_row = cursor.fetchone()
+                    if asset_code_row is None:
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"Mapped asset {asset_id} could not be found.",
+                        )
+                    asset_code = asset_code_row[0]
+
+                    # Previous cumulative energy for this channel/device only.
+                    cursor.execute(
+                        """
+                        SELECT energy_kwh, recorded_at
+                        FROM telemetry
+                        WHERE device_id = %s
+                        ORDER BY recorded_at DESC, id DESC
+                        LIMIT 1;
+                        """,
+                        (device_id,),
+                    )
+                    previous = cursor.fetchone()
+
+                    interval_energy_kwh = None
+                    interval_seconds = None
+                    energy_reset = False
+
+                    if previous is not None:
+                        previous_energy = float(previous[0])
+                        previous_time = previous[1]
+                        seconds = (recorded_at - previous_time).total_seconds()
+                        if seconds > 0 and reading.energy_kwh >= previous_energy:
+                            interval_seconds = seconds
+                            interval_energy_kwh = reading.energy_kwh - previous_energy
+                        elif seconds > 0 and reading.energy_kwh < previous_energy:
+                            interval_seconds = seconds
+                            energy_reset = True
+
+                    cursor.execute(
+                        """
+                        UPDATE devices
+                        SET last_seen_at = %s,
+                            active = TRUE,
+                            asset_id = %s
+                        WHERE device_id = %s;
+                        """,
+                        (recorded_at, asset_id, device_id),
+                    )
+
+                    cursor.execute(
+                        """
+                        UPDATE gateway_channels
+                        SET last_seen_at = %s
+                        WHERE gateway_id = %s
+                          AND channel_id = %s;
+                        """,
+                        (recorded_at, data.gateway_id, reading.channel_id),
+                    )
+
+                    cursor.execute(
+                        """
+                        INSERT INTO telemetry(
+                            device_id,
+                            branch_id,
+                            asset_id,
+                            voltage,
+                            current,
+                            power,
+                            energy_kwh,
+                            frequency,
+                            power_factor,
+                            recorded_at,
+                            interval_energy_kwh,
+                            interval_seconds,
+                            energy_reset
+                        )
+                        VALUES(
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s
+                        )
+                        RETURNING id;
+                        """,
+                        (
+                            device_id,
+                            data.branch_id,
+                            asset_code,
+                            reading.voltage,
+                            reading.current,
+                            reading.power,
+                            reading.energy_kwh,
+                            reading.frequency,
+                            reading.power_factor,
+                            recorded_at,
+                            interval_energy_kwh,
+                            interval_seconds,
+                            energy_reset,
+                        ),
+                    )
+                    telemetry_id = cursor.fetchone()[0]
+
+                    formula_power_kw = active_power_from_vi_pf(
+                        reading.voltage,
+                        reading.current,
+                        reading.power_factor,
+                        phase_count=phase_count,
+                        voltage_basis=voltage_basis,
+                    )
+                    meter_power_kw = reading.power / 1000.0
+
+                    stored.append(
+                        {
+                            "channel_id": reading.channel_id,
+                            "device_id": device_id,
+                            "asset_id": asset_id,
+                            "asset_code": asset_code,
+                            "telemetry_id": telemetry_id,
+                            "meter_power_kw": round(meter_power_kw, 6),
+                            "vi_pf_formula_power_kw": round(formula_power_kw, 6),
+                            "cumulative_energy_kwh": reading.energy_kwh,
+                            "interval_energy_kwh": (
+                                round(interval_energy_kwh, 6)
+                                if interval_energy_kwh is not None
+                                else None
+                            ),
+                            "energy_reset_detected": energy_reset,
+                            "measurement_mode": measurement_mode,
+                        }
+                    )
+
+            conn.commit()
+
+        total_power_kw = sum(item["meter_power_kw"] for item in stored)
+        total_interval_energy = sum(
+            item["interval_energy_kwh"] or 0.0 for item in stored
+        )
+
+        return {
+            "status": "received",
+            "stored": True,
+            "gateway_id": data.gateway_id,
+            "branch_id": data.branch_id,
+            "recorded_at": recorded_at.isoformat(),
+            "channels_received": len(data.readings),
+            "channels_stored": len(stored),
+            "total_power_kw": round(total_power_kw, 6),
+            "batch_interval_energy_kwh": round(total_interval_energy, 6),
+            "channels": stored,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Batch telemetry failed: {exc}")
+
+
+# ============================================================
+# GATEWAY STATUS
+# ============================================================
+
+@app.get("/api/v1/gateways/{gateway_id}")
+def gateway_status(
+    gateway_id: str,
+    stale_after_seconds: int = Query(default=60, ge=10, le=3600),
+):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        gc.channel_id,
+                        gc.device_id,
+                        gc.asset_id,
+                        a.asset_code,
+                        a.name,
+                        gc.last_seen_at,
+                        gc.active
+                    FROM gateway_channels gc
+                    JOIN assets a ON a.id = gc.asset_id
+                    WHERE gc.gateway_id = %s
+                    ORDER BY gc.channel_id;
+                    """,
+                    (gateway_id,),
+                )
+                rows = cursor.fetchall()
+
+        now_utc = datetime.now(timezone.utc)
+        channels = []
+        online = 0
+        for row in rows:
+            last_seen = row[5]
+            is_online = (
+                last_seen is not None
+                and (now_utc - last_seen).total_seconds() <= stale_after_seconds
+            )
+            online += int(is_online)
+            channels.append(
+                {
+                    "channel_id": row[0],
+                    "device_id": row[1],
+                    "asset_id": row[2],
+                    "asset_code": row[3],
+                    "name": row[4],
+                    "last_seen_at": last_seen,
+                    "online": is_online,
+                    "active": row[6],
+                }
+            )
+
+        return {
+            "status": "success",
+            "gateway_id": gateway_id,
+            "channels_configured": len(channels),
+            "online_channels": online,
+            "offline_channels": len(channels) - online,
+            "stale_after_seconds": stale_after_seconds,
+            "channels": channels,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load gateway status: {exc}")
